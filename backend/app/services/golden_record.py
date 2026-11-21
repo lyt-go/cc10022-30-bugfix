@@ -26,7 +26,7 @@ class GoldenRecordService(BaseModuleService):
         设置置信度、关联来源和最后合并时间，生成唯一黄金ID。
         """
         rows = store.rows(self.MODULE)
-        golden_id = f"GR-{entity_model}-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        golden_id = self._next_golden_id(entity_model, rows)
         confidence = self._compute_confidence(len(source_ids))
         entry = {
             "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
@@ -49,6 +49,18 @@ class GoldenRecordService(BaseModuleService):
         rows.append(entry)
         # 写入黄金记录到golden_records存储，关联来源批次与合并追溯信息
         return {"ok": True, "golden_record": entry}
+
+    def _next_golden_id(self, entity_model: str,
+                          rows: list[dict[str, Any]]) -> str:
+        """生成全局唯一黄金ID：时间戳前缀 + 同秒序号，避免同秒创建互相覆盖。"""
+        prefix = f"GR-{entity_model}-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        existing = {r.get("黄金ID") for r in rows}
+        if prefix not in existing:
+            return prefix
+        seq = 1
+        while f"{prefix}-{seq}" in existing:
+            seq += 1
+        return f"{prefix}-{seq}"
 
     def _compute_confidence(self, source_count: int) -> float:
         """计算黄金记录置信度：基于来源数量和质量指标综合评估。"""
@@ -108,6 +120,141 @@ class GoldenRecordService(BaseModuleService):
             "filled": complete_count,
             "missing": missing,
             "completeness": round(complete_count / max(len(required_fields), 1) * 100, 2),
+        }
+
+    def update_golden_record(self, golden_id: str,
+                               changed_data: dict[str, Any]) -> dict[str, Any]:
+        """更新黄金记录：登记实际变更字段，未变化的字段不产生变更。
+
+        仅写入与现值不同的业务字段，返回变化字段及新旧值；
+        记录版本在发生真实变化后递增，最后合并时间同步刷新。
+        执行检测本身不会调用本方法，因此检测不代表数据已变化或已同步。
+        """
+        rows = store.rows(self.MODULE)
+        record = next((r for r in rows if r.get("黄金ID") == golden_id), None)
+        if record is None:
+            return {"ok": False, "reason": "黄金记录不存在"}
+        changed_fields: dict[str, dict[str, Any]] = {}
+        for key, new_val in changed_data.items():
+            if key.startswith("_") or key in ("id", "黄金ID", "实体模型",
+                                              "status", "pending", "abnormal",
+                                              "记录版本", "最后合并"):
+                continue
+            if record.get(key) != new_val:
+                changed_fields[key] = {"old": record.get(key), "new": new_val}
+        if not changed_fields:
+            return {"ok": True, "golden_id": golden_id, "changed_fields": {}, "changed": False}
+        for key, diff in changed_fields.items():
+            record[key] = diff["new"]
+        record["记录版本"] = self._bump_version(record.get("记录版本", "1.0"))
+        record["最后合并"] = datetime.datetime.utcnow().isoformat()
+        # 登记实际变更字段：仅真实变化的字段才进入变更清单并推高记录版本
+        return {
+            "ok": True,
+            "golden_id": golden_id,
+            "changed": True,
+            "changed_fields": changed_fields,
+            "record_version": record["记录版本"],
+        }
+
+    def deactivate_golden_record(self, golden_id: str) -> dict[str, Any]:
+        """停用黄金记录：给出删除边界，停用记录对下游即应删除。"""
+        rows = store.rows(self.MODULE)
+        record = next((r for r in rows if r.get("黄金ID") == golden_id), None)
+        if record is None:
+            return {"ok": False, "reason": "黄金记录不存在"}
+        record["status"] = "已停用"
+        record["pending"] = False
+        record["abnormal"] = True
+        record["停用时间"] = datetime.datetime.utcnow().isoformat()
+        # 停用即删除边界：停用后的黄金记录不再出现在可分发集合中
+        return {"ok": True, "golden_id": golden_id, "status": "已停用"}
+
+    def _bump_version(self, version: str) -> str:
+        """记录版本按小版本递增。"""
+        try:
+            return f"{float(version) + 1.0:.1f}"
+        except (TypeError, ValueError):
+            return "2.0"
+
+    def list_syncable_records(self, entity_model: str) -> list[dict[str, Any]]:
+        """列出可分发黄金记录：删除边界之外的记录（即全部已生效记录）。
+
+        停用/删除的记录不在结果内，分发侧据此与目标实收基准比较出删除集。
+        """
+        rows = store.rows(self.MODULE)
+        return [
+            dict(row) for row in rows
+            if row.get("status") == "已生效"
+            and (not entity_model or row.get("实体模型") == entity_model)
+        ]
+
+    def diff_golden_snapshot(
+        self,
+        baseline: dict[str, dict[str, Any]],
+        entity_model: str,
+        field_scope: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """对比黄金记录与目标实收基准，按黄金ID输出互斥的新增/更新/删除。
+
+        - 基准里没有、当前存在的黄金ID => 新增
+        - 基准里有、当前仍存在但字段值变化 => 更新（附实际变化字段与新旧值）
+        - 基准里有、当前已不存在（停用或移除）=> 删除
+        三类集合以黄金ID互斥，同一条黄金记录在一次检测中只属于其中一类。
+        """
+        scope = [f for f in (field_scope or []) if f]
+        current_rows = self.list_syncable_records(entity_model)
+        current = {row["黄金ID"]: row for row in current_rows}
+
+        def projected(row: dict[str, Any]) -> dict[str, Any]:
+            if not scope:
+                return {k: v for k, v in row.items() if not k.startswith("_")}
+            return {f: row.get(f) for f in scope}
+
+        new_records: list[dict[str, Any]] = []
+        updated_records: list[dict[str, Any]] = []
+        deleted_records: list[dict[str, Any]] = []
+        for golden_id, row in current.items():
+            if golden_id not in baseline:
+                new_records.append({"黄金ID": golden_id, "data": projected(row)})
+                continue
+            old_snapshot = projected(baseline[golden_id])
+            new_snapshot = projected(row)
+            changed = {
+                field: {"old": old_snapshot.get(field), "new": new_snapshot.get(field)}
+                for field in new_snapshot
+                if old_snapshot.get(field) != new_snapshot.get(field)
+            }
+            # 基准中存在但当前投影缺失的字段同样属于更新
+            for field in old_snapshot:
+                if field not in new_snapshot and old_snapshot.get(field) is not None:
+                    changed[field] = {"old": old_snapshot.get(field), "new": None}
+            if changed:
+                updated_records.append({
+                    "黄金ID": golden_id,
+                    "changed_fields": changed,
+                    "data": new_snapshot,
+                })
+        for golden_id, old_row in baseline.items():
+            if golden_id not in current:
+                deleted_records.append({
+                    "黄金ID": golden_id,
+                    "last_data": projected(old_row),
+                })
+        # 互斥校验：同一黄金ID不可能同时出现在两个集合里
+        all_ids = (
+            [r["黄金ID"] for r in new_records]
+            + [r["黄金ID"] for r in updated_records]
+            + [r["黄金ID"] for r in deleted_records]
+        )
+        assert len(all_ids) == len(set(all_ids)), "新增/更新/删除集合存在黄金ID重叠"
+        return {
+            "new_records": new_records,
+            "updated_records": updated_records,
+            "deleted_records": deleted_records,
+            "new_count": len(new_records),
+            "updated_count": len(updated_records),
+            "deleted_count": len(deleted_records),
         }
 
     def search_golden_records(self, entity_model: str | None = None,
